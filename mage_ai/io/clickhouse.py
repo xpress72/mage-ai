@@ -59,7 +59,7 @@ class TableEngines(str, Enum):
 
     @classmethod
     def get_list(cls):
-        return cls._value2member_map_
+        return list(cls._value2member_map_.keys())
 
 
 class ClickHouse(BaseSQLDatabase):
@@ -226,6 +226,8 @@ class ClickHouse(BaseSQLDatabase):
         table_name: str,
         database: str,
         engine: str = TableEngines.MEMORY,
+        order_by: str = None,
+        query_string: str = None,
     ):
         self._check_engine(engine)
 
@@ -240,6 +242,11 @@ class ClickHouse(BaseSQLDatabase):
 
         command = f'CREATE TABLE {database}.{table_name} (' + \
             ', '.join(fields) + f') ENGINE = {engine}'
+        if order_by:
+            command += f' ORDER BY {order_by}'
+        if query_string:
+            command += f' EMPTY AS {query_string}'
+
         return command
 
     def export(
@@ -249,6 +256,7 @@ class ClickHouse(BaseSQLDatabase):
         database: str = None,
         if_exists: str = 'append',
         engine: str = TableEngines.MEMORY,
+        order_by: str = None,
         index: bool = False,
         query_string: Union[str, None] = None,
         create_table_statement: Union[str, None] = None,
@@ -314,10 +322,15 @@ EXISTS TABLE {database}.{table_name}
                 if should_create_table:
                     with self.printer.print_msg(
                            f'Creating a new table: {database}.{table_name}'):
-                        self.client.command(f"""
-CREATE TABLE IF NOT EXISTS {database}.{table_name} ENGINE = {engine} EMPTY AS
-{query_string}
-""")
+                        create_table_stmt = self.build_create_table_command(
+                            df=df,
+                            table_name=table_name,
+                            database=database,
+                            engine=engine,
+                            order_by=order_by,
+                            query_string=query_string,
+                        )
+                        self.client.command(create_table_stmt)
 
                 self.client.command(f"""
 INSERT INTO {database}.{table_name}
@@ -332,6 +345,7 @@ INSERT INTO {database}.{table_name}
                             table_name=table_name,
                             database=database,
                             engine=engine,
+                            order_by=order_by,
                         )
                     with self.printer.print_msg(
                            f'Creating a new table: {create_table_stmt}'):
