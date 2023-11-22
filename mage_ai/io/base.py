@@ -47,6 +47,7 @@ class ExportWritePolicy(str, Enum):
     APPEND = 'append'
     FAIL = 'fail'
     REPLACE = 'replace'
+    TRUNCATE = 'truncate'
 
 
 class BaseIO(ABC):

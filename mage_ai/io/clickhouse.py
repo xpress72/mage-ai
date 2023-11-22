@@ -1,4 +1,5 @@
 from typing import Dict, List, Union
+from enum import Enum
 
 import clickhouse_connect
 from pandas import DataFrame, Series
@@ -10,6 +11,24 @@ from mage_ai.shared.utils import (
     convert_pandas_dtype_to_python_type,
     convert_python_type_to_clickhouse_type,
 )
+
+
+class TableEngines(str, Enum):
+    """
+        Supported table engines for clickhouse databases.
+    """
+    MEMORY = 'Memory'
+    MERGE_TREE = 'MergeTree'
+    REPLICATED_MERGE_TREE = 'ReplicatedMergeTree'
+    SUMMING_MERGE_TREE = 'SummingMergeTree'
+    AGGREGATE_MERGE_TREE = 'AggregatingMergeTree'
+    COLLAPSING_MERGE_TREE = 'CollapsingMergeTree'
+    VERSIONED_COLLAPSING_MERGE_TREE = 'VersionedCollapsingMergeTree'
+    GRAPHITE_MERGE_TREE = 'GraphiteMergeTree'
+
+    @classmethod
+    def has_value(cls, value):
+        return value in cls._value2member_map_
 
 
 class ClickHouse(BaseSQLDatabase):
@@ -164,6 +183,7 @@ class ClickHouse(BaseSQLDatabase):
         df: DataFrame,
         table_name: str,
         database: str,
+        engine: str = TableEngines.MEMORY,
     ):
         dtypes = infer_dtypes(df)
         db_dtypes = {
@@ -174,8 +194,11 @@ class ClickHouse(BaseSQLDatabase):
         for cname in db_dtypes:
             fields.append(f'{cname} {db_dtypes[cname]}')
 
+        if not TableEngines.has_value(engine):
+            engine = TableEngines.MEMORY
+
         command = f'CREATE TABLE {database}.{table_name} (' + \
-            ', '.join(fields) + ') ENGINE = Memory'
+            ', '.join(fields) + f') ENGINE = {engine}'
         return command
 
     def export(
@@ -184,6 +207,7 @@ class ClickHouse(BaseSQLDatabase):
         table_name: str = None,
         database: str = None,
         if_exists: str = 'append',
+        engine: str = TableEngines.MEMORY,
         index: bool = False,
         query_string: Union[str, None] = None,
         create_table_statement: Union[str, None] = None,
@@ -201,10 +225,11 @@ class ClickHouse(BaseSQLDatabase):
             If this table doesn't exist, query_string must be specified to create the new table.
             database (str): Name of the database in which the table is located.
             if_exists (str, optional): Specifies export policy if table exists. Either
-                - `'fail'`: throw an error.
-                - `'replace'`: drops existing table and creates new table of same name.
-                - `'append'`: appends data frame to existing table. In this case the schema must
+                - 'fail': throw an error.
+                - 'replace': drops existing table and creates new table of same name.
+                - 'append': appends data frame to existing table. In this case the schema must
                                 match the original table.
+                - 'truncate': truncates existing table and appends data frame to existing table.
             Defaults to `'append'`.
             **kwargs: Additional arguments to pass to writer
         """
@@ -237,6 +262,9 @@ EXISTS TABLE {database}.{table_name}
                     self.client.command(
                         f'DROP TABLE IF EXISTS {database}.{table_name}')
                     should_create_table = True
+                elif ExportWritePolicy.TRUNCATE == if_exists and table_exists:
+                    self.client.command(f'TRUNCATE TABLE {database}.{table_name}')
+                    should_create_table = False
 
             if query_string:
                 self.client.command(f'USE {database}')
