@@ -1,4 +1,5 @@
 from typing import Dict, List, Union
+from enum import Enum
 
 import clickhouse_connect
 from pandas import DataFrame, Series
@@ -10,6 +11,55 @@ from mage_ai.shared.utils import (
     convert_pandas_dtype_to_python_type,
     convert_python_type_to_clickhouse_type,
 )
+
+
+class TableEngines(str, Enum):
+    """
+        Supported table engines for clickhouse databases.
+    """
+    MEMORY = 'Memory'
+    MERGE_TREE = 'MergeTree'
+    REPLICATED_MERGE_TREE = 'ReplicatedMergeTree'
+    SUMMING_MERGE_TREE = 'SummingMergeTree'
+    AGGREGATE_MERGE_TREE = 'AggregatingMergeTree'
+    COLLAPSING_MERGE_TREE = 'CollapsingMergeTree'
+    VERSIONED_COLLAPSING_MERGE_TREE = 'VersionedCollapsingMergeTree'
+    GRAPHITE_MERGE_TREE = 'GraphiteMergeTree'
+    TINY_LOG = 'TinyLog'
+    STRIPE_LOG = 'StripeLog'
+    LOG = 'Log'
+    ODBC = 'ODBC'
+    JDBC = 'JDBC'
+    MYSQL = 'MySQL'
+    MONGO_DB = 'MongoDB'
+    REDIS = 'Redis'
+    HDFS = 'HDFS'
+    S3 = 'S3'
+    KAFKA = 'Kafka'
+    EMBEDDED_ROCKS_DB = 'EmbeddedRocksDB'
+    RABBITMQ = 'RabbitMQ'
+    POSTGRESQL = 'PostgreSQL'
+    S3_QUEUE = 'S3Queue'
+    DISTRIBUTED = 'Distributed'
+    MATERIALIZED_VIEW = 'MaterializedView'
+    DICTIONARY = 'Dictionary'
+    MERGE = 'Merge'
+    FILE = 'File'
+    NULL = 'Null'
+    SET = 'Set'
+    JOIN = 'Join'
+    URL = 'URL'
+    VIEW = 'View'
+    BUFFER = 'Buffer'
+    KEEPER_MAP = 'KeeperMap'
+
+    @classmethod
+    def has_value(cls, value):
+        return value in cls._value2member_map_
+
+    @classmethod
+    def get_list(cls):
+        return cls._value2member_map_
 
 
 class ClickHouse(BaseSQLDatabase):
@@ -113,6 +163,17 @@ class ClickHouse(BaseSQLDatabase):
 
         return results
 
+    @staticmethod
+    def _check_engine(_engine: str):
+        """
+            Checks if the table engine is valid.
+        """
+        if not TableEngines.has_value(_engine.split('(')[0].strip()):
+            raise ValueError(
+                f'Invalid table engine \'{_engine}\'. '
+                f'Please use one of the following: {TableEngines.get_list()}.'
+            )
+
     def load(
         self,
         query_string: str,
@@ -164,7 +225,10 @@ class ClickHouse(BaseSQLDatabase):
         df: DataFrame,
         table_name: str,
         database: str,
+        engine: str = TableEngines.MEMORY,
     ):
+        self._check_engine(engine)
+
         dtypes = infer_dtypes(df)
         db_dtypes = {
             col: self.get_type(df[col], dtypes[col])
@@ -175,7 +239,7 @@ class ClickHouse(BaseSQLDatabase):
             fields.append(f'{cname} {db_dtypes[cname]}')
 
         command = f'CREATE TABLE {database}.{table_name} (' + \
-            ', '.join(fields) + ') ENGINE = Memory'
+            ', '.join(fields) + f') ENGINE = {engine}'
         return command
 
     def export(
@@ -184,6 +248,7 @@ class ClickHouse(BaseSQLDatabase):
         table_name: str = None,
         database: str = None,
         if_exists: str = 'append',
+        engine: str = TableEngines.MEMORY,
         index: bool = False,
         query_string: Union[str, None] = None,
         create_table_statement: Union[str, None] = None,
@@ -201,10 +266,11 @@ class ClickHouse(BaseSQLDatabase):
             If this table doesn't exist, query_string must be specified to create the new table.
             database (str): Name of the database in which the table is located.
             if_exists (str, optional): Specifies export policy if table exists. Either
-                - `'fail'`: throw an error.
-                - `'replace'`: drops existing table and creates new table of same name.
-                - `'append'`: appends data frame to existing table. In this case the schema must
+                - 'fail': throw an error.
+                - 'replace': drops existing table and creates new table of same name.
+                - 'append': appends data frame to existing table. In this case the schema must
                                 match the original table.
+                - 'truncate': truncates existing table and appends data frame to existing table.
             Defaults to `'append'`.
             **kwargs: Additional arguments to pass to writer
         """
@@ -212,6 +278,8 @@ class ClickHouse(BaseSQLDatabase):
             raise Exception('Please provide a table_name argument in the export method.')
         if database is None:
             database = self.default_database()
+
+        self._check_engine(engine)
 
         if type(df) is dict:
             df = DataFrame([df])
@@ -237,6 +305,8 @@ EXISTS TABLE {database}.{table_name}
                     self.client.command(
                         f'DROP TABLE IF EXISTS {database}.{table_name}')
                     should_create_table = True
+                elif ExportWritePolicy.TRUNCATE == if_exists:
+                    self.client.command(f'TRUNCATE TABLE {database}.{table_name}')
 
             if query_string:
                 self.client.command(f'USE {database}')
@@ -245,7 +315,7 @@ EXISTS TABLE {database}.{table_name}
                     with self.printer.print_msg(
                            f'Creating a new table: {database}.{table_name}'):
                         self.client.command(f"""
-CREATE TABLE IF NOT EXISTS {database}.{table_name} ENGINE = Memory EMPTY AS
+CREATE TABLE IF NOT EXISTS {database}.{table_name} ENGINE = {engine} EMPTY AS
 {query_string}
 """)
 
