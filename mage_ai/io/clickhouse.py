@@ -25,10 +25,41 @@ class TableEngines(str, Enum):
     COLLAPSING_MERGE_TREE = 'CollapsingMergeTree'
     VERSIONED_COLLAPSING_MERGE_TREE = 'VersionedCollapsingMergeTree'
     GRAPHITE_MERGE_TREE = 'GraphiteMergeTree'
+    TINY_LOG = 'TinyLog'
+    STRIPE_LOG = 'StripeLog'
+    LOG = 'Log'
+    ODBC = 'ODBC'
+    JDBC = 'JDBC'
+    MYSQL = 'MySQL'
+    MONGO_DB = 'MongoDB'
+    REDIS = 'Redis'
+    HDFS = 'HDFS'
+    S3 = 'S3'
+    KAFKA = 'Kafka'
+    EMBEDDED_ROCKS_DB = 'EmbeddedRocksDB'
+    RABBITMQ = 'RabbitMQ'
+    POSTGRESQL = 'PostgreSQL'
+    S3_QUEUE = 'S3Queue'
+    DISTRIBUTED = 'Distributed'
+    MATERIALIZED_VIEW = 'MaterializedView'
+    DICTIONARY = 'Dictionary'
+    MERGE = 'Merge'
+    FILE = 'File'
+    NULL = 'Null'
+    SET = 'Set'
+    JOIN = 'Join'
+    URL = 'URL'
+    VIEW = 'View'
+    BUFFER = 'Buffer'
+    KEEPER_MAP = 'KeeperMap'
 
     @classmethod
     def has_value(cls, value):
         return value in cls._value2member_map_
+
+    @classmethod
+    def get_list(cls):
+        return cls._value2member_map_
 
 
 class ClickHouse(BaseSQLDatabase):
@@ -132,6 +163,17 @@ class ClickHouse(BaseSQLDatabase):
 
         return results
 
+    @staticmethod
+    def _check_engine(_engine: str):
+        """
+            Checks if the table engine is valid.
+        """
+        if not TableEngines.has_value(_engine.split('(')[0].strip()):
+            raise ValueError(
+                f'Invalid table engine \'{_engine}\'. '
+                f'Please use one of the following: {TableEngines.get_list()}.'
+            )
+
     def load(
         self,
         query_string: str,
@@ -185,6 +227,8 @@ class ClickHouse(BaseSQLDatabase):
         database: str,
         engine: str = TableEngines.MEMORY,
     ):
+        self._check_engine(engine)
+
         dtypes = infer_dtypes(df)
         db_dtypes = {
             col: self.get_type(df[col], dtypes[col])
@@ -193,9 +237,6 @@ class ClickHouse(BaseSQLDatabase):
         fields = []
         for cname in db_dtypes:
             fields.append(f'{cname} {db_dtypes[cname]}')
-
-        if not TableEngines.has_value(engine):
-            engine = TableEngines.MEMORY
 
         command = f'CREATE TABLE {database}.{table_name} (' + \
             ', '.join(fields) + f') ENGINE = {engine}'
@@ -238,6 +279,8 @@ class ClickHouse(BaseSQLDatabase):
         if database is None:
             database = self.default_database()
 
+        self._check_engine(engine)
+
         if type(df) is dict:
             df = DataFrame([df])
         elif type(df) is list:
@@ -262,9 +305,8 @@ EXISTS TABLE {database}.{table_name}
                     self.client.command(
                         f'DROP TABLE IF EXISTS {database}.{table_name}')
                     should_create_table = True
-                elif ExportWritePolicy.TRUNCATE == if_exists and table_exists:
+                elif ExportWritePolicy.TRUNCATE == if_exists:
                     self.client.command(f'TRUNCATE TABLE {database}.{table_name}')
-                    should_create_table = False
 
             if query_string:
                 self.client.command(f'USE {database}')
@@ -273,7 +315,7 @@ EXISTS TABLE {database}.{table_name}
                     with self.printer.print_msg(
                            f'Creating a new table: {database}.{table_name}'):
                         self.client.command(f"""
-CREATE TABLE IF NOT EXISTS {database}.{table_name} ENGINE = Memory EMPTY AS
+CREATE TABLE IF NOT EXISTS {database}.{table_name} ENGINE = {engine} EMPTY AS
 {query_string}
 """)
 
