@@ -331,6 +331,7 @@ INSERT INTO {database}.{table_name}
                             df=df,
                             table_name=table_name,
                             database=database,
+                            engine=engine,
                         )
                     with self.printer.print_msg(
                            f'Creating a new table: {create_table_stmt}'):
