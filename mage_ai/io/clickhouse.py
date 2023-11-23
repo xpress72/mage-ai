@@ -246,6 +246,8 @@ class ClickHouse(BaseSQLDatabase):
             command += f' ORDER BY {order_by}'
         if query_string:
             command += f' EMPTY AS {query_string}'
+        if order_by:
+            command += ' SETTINGS allow_nullable_key=1'
 
         return command
 
