@@ -5,7 +5,12 @@ from dataclasses import dataclass, field
 from enum import Enum
 from typing import Callable, Dict, List
 
-from kafka import KafkaConsumer
+from confluent_kafka import Consumer, TopicPartition
+from confluent_kafka.avro import AvroConsumer
+from confluent_kafka.avro.serializer import SerializerError
+from confluent_kafka.schema_registry import SchemaRegistryClient
+from confluent_kafka.schema_registry.avro import AvroDeserializer
+from confluent_kafka.serialization import StringDeserializer
 
 from mage_ai.shared.config import BaseConfig
 from mage_ai.streaming.constants import DEFAULT_BATCH_SIZE, DEFAULT_TIMEOUT_MS
@@ -51,15 +56,15 @@ class KafkaConfig(BaseConfig):
     topics: List = field(default_factory=list)
 
     @classmethod
-    def parse_config(self, config: Dict) -> Dict:
+    def parse_config(cls, config: Dict) -> Dict:
         ssl_config = config.get('ssl_config')
         sasl_config = config.get('sasl_config')
         serde_config = config.get('serde_config')
-        if ssl_config and type(ssl_config) is dict:
+        if ssl_config and isinstance(ssl_config, dict):
             config['ssl_config'] = SSLConfig(**ssl_config)
-        if sasl_config and type(sasl_config) is dict:
+        if sasl_config and isinstance(sasl_config, dict):
             config['sasl_config'] = SASLConfig(**sasl_config)
-        if serde_config and type(serde_config) is dict:
+        if serde_config and isinstance(serde_config, dict):
             config['serde_config'] = SerDeConfig(**serde_config)
         return config
 
@@ -72,53 +77,39 @@ class KafkaSource(BaseSource):
             raise Exception('Please specify topic or topics in the Kafka config.')
 
         self._print('Start initializing consumer.')
-        # Initialize kafka consumer
-        consumer_kwargs = dict(
-            group_id=self.config.consumer_group,
-            bootstrap_servers=self.config.bootstrap_server,
-            api_version=self.config.api_version,
-            enable_auto_commit=True,
-        )
-        if self.config.security_protocol == SecurityProtocol.SSL:
-            consumer_kwargs['security_protocol'] = SecurityProtocol.SSL
-            consumer_kwargs['ssl_cafile'] = self.config.ssl_config.cafile
-            consumer_kwargs['ssl_certfile'] = self.config.ssl_config.certfile
-            consumer_kwargs['ssl_keyfile'] = self.config.ssl_config.keyfile
-            consumer_kwargs['ssl_password'] = self.config.ssl_config.password
-            consumer_kwargs[
-                'ssl_check_hostname'
-            ] = self.config.ssl_config.check_hostname
-        elif self.config.security_protocol == SecurityProtocol.SASL_SSL:
-            consumer_kwargs['security_protocol'] = SecurityProtocol.SASL_SSL
-            consumer_kwargs['sasl_mechanism'] = self.config.sasl_config.mechanism
-            consumer_kwargs['sasl_plain_username'] = self.config.sasl_config.username
-            consumer_kwargs['sasl_plain_password'] = self.config.sasl_config.password
+        consumer_config = {
+            'bootstrap.servers': self.config.bootstrap_server,
+            'group.id': self.config.consumer_group,
+            'auto.offset.reset': 'earliest',
+            'enable.auto.commit': True,
+            'api.version.request': True,
+            # Add additional configuration as needed
+        }
 
-            if self.config.ssl_config is not None and self.config.ssl_config.cafile:
-                consumer_kwargs['ssl_cafile'] = self.config.ssl_config.cafile
-        elif self.config.security_protocol == SecurityProtocol.SASL_PLAINTEXT:
-            consumer_kwargs['security_protocol'] = SecurityProtocol.SASL_PLAINTEXT
-            consumer_kwargs['sasl_mechanism'] = self.config.sasl_config.mechanism
-            consumer_kwargs['sasl_plain_username'] = self.config.sasl_config.username
-            consumer_kwargs['sasl_plain_password'] = self.config.sasl_config.password
+        # Add security protocols to the configuration
+        if self.config.security_protocol in [SecurityProtocol.SSL, SecurityProtocol.SASL_SSL]:
+            consumer_config['security.protocol'] = self.config.security_protocol.value
+            if self.config.ssl_config.cafile:
+                consumer_config['ssl.ca.location'] = self.config.ssl_config.cafile
+            if self.config.ssl_config.certfile:
+                consumer_config['ssl.certificate.location'] = self.config.ssl_config.certfile
+            if self.config.ssl_config.keyfile:
+                consumer_config['ssl.key.location'] = self.config.ssl_config.keyfile
+            if self.config.ssl_config.password:
+                consumer_config['ssl.key.password'] = self.config.ssl_config.password
+            consumer_config[
+                'ssl.endpoint.identification.algorithm'] = '' if not self.config.ssl_config.check_hostname else 'https'
 
-        if self.config.topic:
-            topics = [self.config.topic]
-        else:
-            topics = self.config.topics
+        if self.config.security_protocol in [SecurityProtocol.SASL_PLAINTEXT, SecurityProtocol.SASL_SSL]:
+            consumer_config['sasl.mechanism'] = self.config.sasl_config.mechanism
+            consumer_config['sasl.username'] = self.config.sasl_config.username
+            consumer_config['sasl.password'] = self.config.sasl_config.password
 
-        self.consumer = KafkaConsumer(*topics, **consumer_kwargs)
-        self._print('Finish initializing consumer.')
-
+        # Initialize the schema class if needed
         self.schema_class = None
-        if self.config.serde_config is not None:
-            if (
-                self.config.serde_config.serialization_method
-                == SerializationMethod.PROTOBUF
-            ):
-                schema_classpath = self.config.serde_config.schema_classpath
-                if schema_classpath is None:
-                    return
+        if self.config.serde_config and self.config.serde_config.serialization_method == SerializationMethod.PROTOBUF:
+            schema_classpath = self.config.serde_config.schema_classpath
+            if schema_classpath is not None:
                 self._print(f'Loading message schema from {schema_classpath}')
                 parts = schema_classpath.split('.')
                 if len(parts) >= 2:
@@ -128,121 +119,25 @@ class KafkaSource(BaseSource):
                         importlib.import_module(libpath),
                         class_name,
                     )
-            elif (
-                self.config.serde_config.serialization_method
-                == SerializationMethod.AVRO
-            ):
-                from confluent_avro import AvroKeyValueSerde, SchemaRegistry
-                from confluent_avro.schema_registry import HTTPBasicAuth
 
-                self.registry_client = SchemaRegistry(
-                    self.config.serde_config.schema_registry_url,
-                    HTTPBasicAuth(
-                        self.config.serde_config.schema_registry_username,
-                        self.config.serde_config.schema_registry_password,
-                    ),
-                    headers={'Content-Type': 'application/vnd.schemaregistry.v1+json'},
-                )
-                self.avro_serde = AvroKeyValueSerde(
-                    self.registry_client, self.config.topic
-                )
+        # Setting up the Avro consumer if needed
+        if self.config.serde_config and self.config.serde_config.serialization_method == SerializationMethod.AVRO:
+            schema_registry_client = SchemaRegistryClient({'url': self.config.serde_config.schema_registry_url})
+            string_deserializer = StringDeserializer('utf_8')
+            avro_deserializer = AvroDeserializer(schema_registry_client=schema_registry_client)
 
-    def _convert_message(self, message):
-        if self.config.include_metadata:
-            message = {
-                'data': self.__deserialize_message(message.value),
-                'metadata': {
-                    'key': message.key.decode() if message.key else None,
-                    'partition': message.partition,
-                    'offset': message.offset,
-                    'time': int(message.timestamp),
-                    'topic': message.topic,
-                },
-            }
+            consumer_config.update({
+                'key.deserializer': string_deserializer,
+                'value.deserializer': avro_deserializer,
+            })
+            self.consumer = AvroConsumer(consumer_config)
         else:
-            message = self.__deserialize_message(message.value)
-        return message
+            self.consumer = Consumer(consumer_config)
 
-    def read(self, handler: Callable):
-        self._print('Start consuming single messages.')
-        for message in self.consumer:
-            self.__print_message(message)
-            message = self._convert_message(message)
-            handler(message)
-
-    async def read_async(self, handler: Callable):
-        self._print('Start consuming messages asynchronously.')
-        for message in self.consumer:
-            self.__print_message(message)
-            message = self._convert_message(message)
-            await handler(message)
-
-    def batch_read(self, handler: Callable):
-        self._print('Start consuming messages in batches.')
-        if self.config.batch_size > 0:
-            batch_size = self.config.batch_size
+        # Subscribe to the topic
+        if self.config.topic:
+            topics = [self.config.topic]
         else:
-            batch_size = DEFAULT_BATCH_SIZE
-        if self.config.timeout_ms > 0:
-            timeout_ms = self.config.timeout_ms
-        else:
-            timeout_ms = DEFAULT_TIMEOUT_MS
-
-        while True:
-            # Response format is {TopicPartiton('topic1', 1): [msg1, msg2]}
-            msg_pack = self.consumer.poll(
-                max_records=batch_size,
-                timeout_ms=timeout_ms,
-            )
-
-            message_values = []
-            msg_printed = False
-            for _tp, messages in msg_pack.items():
-                self._print(
-                    f'Received {len(messages)} messages from topic="{_tp.topic}" '
-                    + f'partition={_tp.partition} at time={time.time()}'
-                )
-                for message in messages:
-                    if not msg_printed:
-                        self.__print_message(message)
-                        msg_printed = True
-
-                    message = self._convert_message(message)
-                    message_values.append(message)
-            if len(message_values) > 0:
-                handler(message_values)
-
-    def test_connection(self):
-        return True
-
-    def __deserialize_message(self, message):
-        if self.config.serde_config is None:
-            return self.__deserialize_json(message)
-        if (
-            self.config.serde_config.serialization_method
-            == SerializationMethod.PROTOBUF
-            and self.schema_class is not None
-        ):
-            from google.protobuf.json_format import MessageToDict
-
-            obj = self.schema_class()
-            obj.ParseFromString(message)
-            return MessageToDict(obj)
-        elif self.config.serde_config.serialization_method == SerializationMethod.AVRO:
-            return self.avro_serde.value.deserialize(message)
-        elif (
-            self.config.serde_config.serialization_method
-            == SerializationMethod.RAW_VALUE
-        ):
-            return message
-        else:
-            return json.loads(message.decode('utf-8'))
-
-    def __deserialize_json(self, message):
-        return json.loads(message.decode('utf-8'))
-
-    def __print_message(self, message):
-        self._print(
-            f'Receive message {message.partition}:{message.offset}: '
-            f'key={message.key}, value={message.value}, time={time.time()}'
-        )
+            topics = self.config.topics
+        self.consumer.subscribe(topics)
+        self._print('Consumer initialized.')
